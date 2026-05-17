@@ -43,60 +43,80 @@ def build_parser() -> argparse.ArgumentParser:
         default="restricted",
         help="Use restricted for read-only access. Defaults to restricted.",
     )
-    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="Max rows or text chunks to show.")
-    parser.add_argument("--full", action="store_true", help="Disable output truncation.")
+    parser.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Max rows or text chunks to show.")
+    parser.add_argument("--full", action="store_true", default=argparse.SUPPRESS, help="Disable output truncation.")
     parser.set_defaults(command="dashboard")
 
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("schemas", help="List database schemas.")
+    schemas = subparsers.add_parser("schemas", help="List database schemas.")
+    add_output_options(schemas)
 
     objects = subparsers.add_parser("objects", help="List schema objects.")
     objects.add_argument("schema", nargs="?", default="public")
     objects.add_argument("--type", choices=["table", "view", "sequence", "extension"], default="table")
+    add_output_options(objects)
 
     describe = subparsers.add_parser("describe", help="Describe an object, e.g. public.users.")
     describe.add_argument("object")
     describe.add_argument("--type", choices=["table", "view", "sequence", "extension"], default="table")
+    add_output_options(describe)
 
     sql = subparsers.add_parser("sql", help="Execute SQL.")
     sql.add_argument("query")
+    add_output_options(sql)
 
     explain = subparsers.add_parser("explain", help="Explain SQL.")
     explain.add_argument("query")
     explain.add_argument("--analyze", action="store_true")
     explain.add_argument("--hypothetical-indexes", default="[]", help="JSON list of hypothetical indexes.")
+    add_output_options(explain)
 
     top = subparsers.add_parser("top", help="Show top queries from pg_stat_statements.")
     top.add_argument("--sort-by", choices=["resources", "mean_time", "total_time"], default="resources")
-    top.add_argument("--limit", type=int, default=10)
+    top.add_argument("--limit", type=int, default=argparse.SUPPRESS)
+    top.add_argument("--full", action="store_true", default=argparse.SUPPRESS, help="Disable output truncation.")
 
     health = subparsers.add_parser("health", help="Run database health checks.")
     health.add_argument("--type", default="all")
+    add_output_options(health)
 
     indexes = subparsers.add_parser("indexes", help="Analyze index opportunities.")
     index_subparsers = indexes.add_subparsers(dest="index_command", required=True)
     workload = index_subparsers.add_parser("workload", help="Analyze workload indexes.")
     workload.add_argument("--max-index-size-mb", type=int, default=10000)
     workload.add_argument("--method", choices=["dta", "llm"], default="dta")
+    add_output_options(workload)
     queries = index_subparsers.add_parser("queries", help="Analyze indexes for specific queries.")
     queries.add_argument("queries", nargs="+")
     queries.add_argument("--max-index-size-mb", type=int, default=10000)
     queries.add_argument("--method", choices=["dta", "llm"], default="dta")
+    add_output_options(queries)
 
     inspect = subparsers.add_parser("inspect", help="Describe an object with next-step hints.")
     inspect.add_argument("object")
     inspect.add_argument("--type", choices=["table", "view", "sequence", "extension"], default="table")
+    add_output_options(inspect)
 
     diagnose = subparsers.add_parser("diagnose", help="Explain and index-analyze a query.")
     diagnose.add_argument("query")
     diagnose.add_argument("--max-index-size-mb", type=int, default=10000)
     diagnose.add_argument("--method", choices=["dta", "llm"], default="dta")
+    add_output_options(diagnose)
 
     return parser
 
 
+def add_output_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Max rows or text chunks to show.")
+    parser.add_argument("--full", action="store_true", default=argparse.SUPPRESS, help="Disable output truncation.")
+
+
 def validate_args(args: argparse.Namespace) -> None:
+    if not hasattr(args, "limit"):
+        args.limit = 10 if args.command == "top" else DEFAULT_LIMIT
+    if not hasattr(args, "full"):
+        args.full = False
     if args.command == "explain":
         args.hypothetical_indexes = parse_json_list(args.hypothetical_indexes)
 
