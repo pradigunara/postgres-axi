@@ -21,7 +21,11 @@ class FakeAdapter:
         self.calls.append(("list_objects", (schema_name, object_type)))
         if object_type == "extension":
             return [{"schema": schema_name, "name": "pg_stat_statements", "type": object_type}]
-        return [{"schema": schema_name, "name": "users", "type": object_type}]
+        return [
+            {"schema": schema_name, "name": "users", "type": object_type},
+            {"schema": schema_name, "name": "app_users", "type": object_type},
+            {"schema": schema_name, "name": "audit_log", "type": object_type},
+        ]
 
     async def get_object_details(self, schema_name: str, object_name: str, object_type: str) -> Any:
         self.calls.append(("get_object_details", (schema_name, object_name, object_type)))
@@ -31,6 +35,18 @@ class FakeAdapter:
             "type": object_type,
             "columns": [{"name": "id", "type": "integer"}],
         }
+
+    async def validate_object_metadata(self, schema_name: str, object_name: str, object_type: str) -> dict[str, Any]:
+        self.calls.append(("validate_object_metadata", (schema_name, object_name, object_type)))
+        if object_name == "missing":
+            raise AxiError(code="object_not_found", message=f"No {object_type} named {schema_name}.{object_name} was found.")
+        if object_name == "actual_view" and object_type == "table":
+            raise AxiError(
+                code="object_type_mismatch",
+                message=f"{schema_name}.{object_name} is a view, not a table.",
+                hint="Use --type view.",
+            )
+        return {"schema": schema_name, "name": object_name, "type": object_type}
 
     async def execute_sql(self, sql: str) -> Any:
         self.calls.append(("execute_sql", (sql,)))
@@ -44,6 +60,8 @@ class FakeAdapter:
 
     async def get_top_queries(self, sort_by: str, limit: int) -> Any:
         self.calls.append(("get_top_queries", (sort_by, limit)))
+        if sort_by == "resources":
+            raise AxiError(code="upstream_error", message="resource-intensive queries: division by zero")
         return [{"query": "select 1", "calls": 7, "mean_time": 1.25}]
 
     async def analyze_db_health(self, health_type: str) -> Any:
@@ -100,10 +118,41 @@ def test_dispatch_schemas() -> None:
 def test_dispatch_objects() -> None:
     output, adapter = run_dispatch(["objects", "app", "--type", "view"])
 
-    assert "objects[1]{schema,name,type}:" in output
+    assert "objects[3]{schema,name,type}:" in output
     assert "app,users,view" in output
+    assert "app,app_users,view" in output
+    assert "app,audit_log,view" in output
     assert "Run `postgres-axi describe app.<name> --type view`" in output
     assert adapter.calls == [("list_objects", ("app", "view"))]
+
+
+def test_dispatch_objects_filters_client_side() -> None:
+    output, adapter = run_dispatch(["objects", "app", "--type", "table", "--filter", "user"])
+
+    assert "objects[2]{schema,name,type}:" in output
+    assert "app,users,table" in output
+    assert "app,app_users,table" in output
+    assert "audit_log" not in output
+    assert adapter.calls == [("list_objects", ("app", "table"))]
+
+
+def test_dispatch_objects_filters_by_prefix_client_side() -> None:
+    output, adapter = run_dispatch(["objects", "app", "--type", "table", "--prefix", "app_"])
+
+    assert "objects[1]{schema,name,type}:" in output
+    assert "app,app_users,table" in output
+    assert "audit_log" not in output
+    assert adapter.calls == [("list_objects", ("app", "table"))]
+
+
+def test_dispatch_objects_combines_filter_and_prefix_client_side() -> None:
+    output, adapter = run_dispatch(["objects", "app", "--type", "table", "--filter", "users", "--prefix", "app_"])
+
+    assert "objects[1]{schema,name,type}:" in output
+    assert "app,app_users,table" in output
+    assert "app,users,table" not in output
+    assert "audit_log" not in output
+    assert adapter.calls == [("list_objects", ("app", "table"))]
 
 
 def test_dispatch_describe() -> None:
@@ -113,7 +162,40 @@ def test_dispatch_describe() -> None:
     assert "schema: app" in output
     assert "columns[1]{name,type}:" in output
     assert "Run `postgres-axi inspect app.users`" in output
-    assert adapter.calls == [("get_object_details", ("app", "users", "table"))]
+    assert 'Run `postgres-axi sql "select count(*) from app.users"`' in output
+    assert 'Run `postgres-axi explain "select count(*) from app.users"`' in output
+    assert "select * from app.users" not in output
+    assert adapter.calls == [
+        ("validate_object_metadata", ("app", "users", "table")),
+        ("get_object_details", ("app", "users", "table")),
+    ]
+
+
+def test_dispatch_describe_missing_object_raises_not_found() -> None:
+    adapter = FakeAdapter()
+
+    try:
+        run_dispatch(["describe", "app.missing"], adapter)
+    except AxiError as exc:
+        assert exc.code == "object_not_found"
+    else:
+        raise AssertionError("expected object_not_found")
+
+    assert adapter.calls == [("validate_object_metadata", ("app", "missing", "table"))]
+
+
+def test_dispatch_describe_type_mismatch_raises() -> None:
+    adapter = FakeAdapter()
+
+    try:
+        run_dispatch(["describe", "app.actual_view"], adapter)
+    except AxiError as exc:
+        assert exc.code == "object_type_mismatch"
+        assert exc.hint == "Use --type view."
+    else:
+        raise AssertionError("expected object_type_mismatch")
+
+    assert adapter.calls == [("validate_object_metadata", ("app", "actual_view", "table"))]
 
 
 def test_dispatch_sql() -> None:
@@ -155,6 +237,17 @@ def test_dispatch_top() -> None:
     assert adapter.calls == [("get_top_queries", ("mean_time", 5))]
 
 
+def test_dispatch_top_resources_falls_back_to_total_time_on_division_by_zero() -> None:
+    output, adapter = run_dispatch(["top", "--sort-by", "resources", "--limit", "5"])
+
+    assert "queries[1]{query,calls,mean_time}:" in output
+    assert "fell back to `--sort-by total_time`" in output
+    assert adapter.calls == [
+        ("get_top_queries", ("resources", 5)),
+        ("get_top_queries", ("total_time", 5)),
+    ]
+
+
 def test_dispatch_health() -> None:
     output, adapter = run_dispatch(["health", "--type", "indexes"])
 
@@ -187,8 +280,13 @@ def test_dispatch_inspect() -> None:
     assert "object:" in output
     assert "name: users" in output
     assert 'Run `postgres-axi sql "select count(*) from app.users"`' in output
-    assert 'Run `postgres-axi indexes queries "select * from app.users where <predicate>"`' in output
-    assert adapter.calls == [("get_object_details", ("app", "users", "table"))]
+    assert 'Run `postgres-axi explain "select count(*) from app.users"`' in output
+    assert 'Run `postgres-axi indexes queries "select 1 from app.users where <predicate>"`' in output
+    assert "select * from app.users" not in output
+    assert adapter.calls == [
+        ("validate_object_metadata", ("app", "users", "table")),
+        ("get_object_details", ("app", "users", "table")),
+    ]
 
 
 def test_dispatch_diagnose_preserves_plan_when_index_analysis_fails() -> None:

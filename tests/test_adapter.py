@@ -1,5 +1,6 @@
 import asyncio
 import builtins
+import logging
 import sys
 import types
 from unittest.mock import AsyncMock
@@ -74,6 +75,49 @@ def test_missing_postgres_mcp_import_raises_missing_dependency(monkeypatch) -> N
     assert exc.value.code == "missing_dependency"
 
 
+def test_connect_quiets_upstream_logs_before_postgres_mcp_import(monkeypatch) -> None:
+    server = make_server()
+    module = types.ModuleType("postgres_mcp")
+    module.server = server
+    real_import = builtins.__import__
+    logger_names = ("postgres_mcp", "mcp", "psycopg", "psycopg.pool", "psycopg_pool")
+    original_state = {
+        name: (logging.getLogger(name).level, logging.getLogger(name).propagate) for name in logger_names
+    }
+    original_disable = logging.root.manager.disable
+
+    for name in logger_names:
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.NOTSET)
+        logger.propagate = True
+
+    def fake_import(name, *args, **kwargs):
+        if name == "postgres_mcp":
+            for logger_name in logger_names:
+                logger = logging.getLogger(logger_name)
+                assert logger.level == logging.CRITICAL
+                assert logger.propagate is False
+            assert logging.root.manager.disable == logging.ERROR
+            return module
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    adapter = McpApiAdapter(database_url="postgresql://example/db", access_mode="restricted")
+
+    async def exercise() -> None:
+        async with adapter.connect():
+            pass
+
+    try:
+        run(exercise())
+    finally:
+        for name, (level, propagate) in original_state.items():
+            logger = logging.getLogger(name)
+            logger.setLevel(level)
+            logger.propagate = propagate
+        logging.disable(original_disable)
+
+
 def test_connect_sets_access_mode_connects_pool_and_closes_on_exit(monkeypatch) -> None:
     server = make_server()
     install_fake_postgres_mcp(monkeypatch, server)
@@ -143,3 +187,85 @@ def test_upstream_exceptions_become_upstream_call_failed(monkeypatch) -> None:
 
     assert exc.value.code == "upstream_call_failed"
     assert exc.value.message == "boom"
+
+
+def test_validate_object_metadata_returns_matching_object(monkeypatch) -> None:
+    list_objects = AsyncMock(return_value=[TextContent(repr([{"schema": "app", "name": "users", "type": "table"}]))])
+    server = make_server(list_objects=list_objects)
+    install_fake_postgres_mcp(monkeypatch, server)
+    adapter = McpApiAdapter(database_url="postgresql://example/db", access_mode="restricted")
+
+    async def exercise():
+        async with adapter.connect():
+            return await adapter.validate_object_metadata("app", "users", "table")
+
+    assert run(exercise()) == {"schema": "app", "name": "users", "type": "table"}
+    list_objects.assert_awaited_once_with("app", "table")
+
+
+def test_validate_object_metadata_detects_type_mismatch(monkeypatch) -> None:
+    async def list_objects(schema_name, object_type):
+        objects_by_type = {
+            "table": [],
+            "view": [{"schema": schema_name, "object_name": "users", "object_type": "view"}],
+        }
+        return [TextContent(repr(objects_by_type.get(object_type, [])))]
+
+    upstream = AsyncMock(side_effect=list_objects)
+    server = make_server(list_objects=upstream)
+    install_fake_postgres_mcp(monkeypatch, server)
+    adapter = McpApiAdapter(database_url="postgresql://example/db", access_mode="restricted")
+
+    async def exercise() -> None:
+        async with adapter.connect():
+            await adapter.validate_object_metadata("app", "users", "table")
+
+    with pytest.raises(AxiError) as exc:
+        run(exercise())
+
+    assert exc.value.code == "object_type_mismatch"
+    assert exc.value.message == "app.users is a view, not a table."
+    assert upstream.await_args_list[0].args == ("app", "table")
+    assert ("app", "view") in [call.args for call in upstream.await_args_list]
+
+
+def test_validate_object_metadata_normalizes_base_table_type_mismatch(monkeypatch) -> None:
+    async def list_objects(schema_name, object_type):
+        objects_by_type = {
+            "view": [],
+            "table": [{"schema": schema_name, "name": "users", "type": "BASE TABLE"}],
+        }
+        return [TextContent(repr(objects_by_type.get(object_type, [])))]
+
+    upstream = AsyncMock(side_effect=list_objects)
+    server = make_server(list_objects=upstream)
+    install_fake_postgres_mcp(monkeypatch, server)
+    adapter = McpApiAdapter(database_url="postgresql://example/db", access_mode="restricted")
+
+    async def exercise() -> None:
+        async with adapter.connect():
+            await adapter.validate_object_metadata("app", "users", "view")
+
+    with pytest.raises(AxiError) as exc:
+        run(exercise())
+
+    assert exc.value.code == "object_type_mismatch"
+    assert exc.value.message == "app.users is a table, not a view."
+    assert exc.value.hint == "Use --type table."
+
+
+def test_validate_object_metadata_detects_missing_object(monkeypatch) -> None:
+    list_objects = AsyncMock(return_value=[TextContent(repr([]))])
+    server = make_server(list_objects=list_objects)
+    install_fake_postgres_mcp(monkeypatch, server)
+    adapter = McpApiAdapter(database_url="postgresql://example/db", access_mode="restricted")
+
+    async def exercise() -> None:
+        async with adapter.connect():
+            await adapter.validate_object_metadata("app", "missing", "table")
+
+    with pytest.raises(AxiError) as exc:
+        run(exercise())
+
+    assert exc.value.code == "object_not_found"
+    assert exc.value.message == "No table named app.missing was found."

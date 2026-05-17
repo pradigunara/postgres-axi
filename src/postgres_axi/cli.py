@@ -55,6 +55,8 @@ def build_parser() -> argparse.ArgumentParser:
     objects = subparsers.add_parser("objects", help="List schema objects.")
     objects.add_argument("schema", nargs="?", default="public")
     objects.add_argument("--type", choices=["table", "view", "sequence", "extension"], default="table")
+    objects.add_argument("--filter", help="Show objects whose name contains this text.")
+    objects.add_argument("--prefix", help="Show objects whose name starts with this prefix.")
     add_output_options(objects)
 
     describe = subparsers.add_parser("describe", help="Describe an object, e.g. public.users.")
@@ -137,21 +139,27 @@ async def dispatch(args: argparse.Namespace, adapter: McpApiAdapter) -> str:
             ],
         )
     if args.command == "objects":
+        objects = await adapter.list_objects(args.schema, args.type)
         return render_value(
-            await adapter.list_objects(args.schema, args.type),
+            filter_objects(objects, args.filter, args.prefix),
             name="objects",
             limit=limit,
-            help=[f"Run `postgres-axi describe {args.schema}.<name> --type {args.type}`"],
+            help=[
+                f"Run `postgres-axi describe {args.schema}.<name> --type {args.type}`",
+                f"Run `postgres-axi objects {args.schema} --type {args.type} --prefix <prefix>`",
+            ],
         )
     if args.command == "describe":
         schema, name = split_object(args.object)
+        await adapter.validate_object_metadata(schema, name, args.type)
         return render_value(
             await adapter.get_object_details(schema, name, args.type),
             name="object",
             limit=limit,
             help=[
                 f"Run `postgres-axi inspect {schema}.{name}`",
-                f"Run `postgres-axi sql \"select * from {schema}.{name} limit 20\"`",
+                f"Run `postgres-axi sql \"select count(*) from {schema}.{name}\"`",
+                f"Run `postgres-axi explain \"select count(*) from {schema}.{name}\"`",
             ],
         )
     if args.command == "sql":
@@ -164,8 +172,23 @@ async def dispatch(args: argparse.Namespace, adapter: McpApiAdapter) -> str:
             help=[f"Run `postgres-axi diagnose {shell_quote(args.query)}`"],
         )
     if args.command == "top":
+        try:
+            queries = await adapter.get_top_queries(args.sort_by, args.limit)
+        except AxiError as exc:
+            if args.sort_by != "resources" or "division by zero" not in exc.message:
+                raise
+            queries = await adapter.get_top_queries("total_time", args.limit)
+            return render_value(
+                queries,
+                name="queries",
+                limit=args.limit,
+                help=[
+                    "`--sort-by resources` failed with division by zero; fell back to `--sort-by total_time`",
+                    "Run `postgres-axi top --sort-by mean_time --limit 10`",
+                ],
+            )
         return render_value(
-            await adapter.get_top_queries(args.sort_by, args.limit),
+            queries,
             name="queries",
             limit=args.limit,
             help=["Run `postgres-axi indexes workload`"],
@@ -212,6 +235,7 @@ async def dispatch_indexes(args: argparse.Namespace, adapter: McpApiAdapter, lim
 
 
 async def inspect_object(adapter: McpApiAdapter, schema: str, name: str, object_type: str, limit: int) -> str:
+    await adapter.validate_object_metadata(schema, name, object_type)
     details = await adapter.get_object_details(schema, name, object_type)
     return render_value(
         details,
@@ -219,8 +243,8 @@ async def inspect_object(adapter: McpApiAdapter, schema: str, name: str, object_
         limit=limit,
         help=[
             f"Run `postgres-axi sql \"select count(*) from {schema}.{name}\"`",
-            f"Run `postgres-axi sql \"select * from {schema}.{name} limit 20\"`",
-            f"Run `postgres-axi indexes queries \"select * from {schema}.{name} where <predicate>\"`",
+            f"Run `postgres-axi explain \"select count(*) from {schema}.{name}\"`",
+            f"Run `postgres-axi indexes queries \"select 1 from {schema}.{name} where <predicate>\"`",
         ],
     )
 
@@ -256,6 +280,37 @@ def split_object(raw: str) -> tuple[str, str]:
     if not schema or not name:
         raise AxiError(code="invalid_object_name", message="Use object names like public.users.")
     return schema, name
+
+
+def filter_objects(objects: Any, text_filter: str | None, prefix: str | None) -> Any:
+    if not text_filter and not prefix:
+        return objects
+    if not isinstance(objects, list):
+        return objects
+
+    return [obj for obj in objects if object_name_matches(obj, text_filter, prefix)]
+
+
+def object_name_matches(obj: Any, text_filter: str | None, prefix: str | None) -> bool:
+    name = object_name(obj)
+    if name is None:
+        return True
+    normalized_name = name.lower()
+    if text_filter and text_filter.lower() not in normalized_name:
+        return False
+    if prefix and not normalized_name.startswith(prefix.lower()):
+        return False
+    return True
+
+
+def object_name(obj: Any) -> str | None:
+    if isinstance(obj, dict):
+        for key in ("name", "object_name"):
+            value = obj.get(key)
+            if isinstance(value, str):
+                return value
+        return None
+    return obj if isinstance(obj, str) else None
 
 
 def parse_json_list(raw: str) -> list[dict[str, Any]]:

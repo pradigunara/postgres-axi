@@ -7,6 +7,7 @@ from typing import Any
 
 
 DEFAULT_LIMIT = 20
+MAX_CELL_CHARS = 180
 
 
 @dataclass
@@ -56,6 +57,9 @@ def render_value(
     if value is None:
         lines = [f"{name}: null"]
     elif isinstance(value, str):
+        structured = _parse_structured_text(value)
+        if structured is not value:
+            return render_value(structured, name=name, limit=limit, fields=fields, help=help)
         lines = _render_text(name, value, limit)
     elif isinstance(value, Mapping):
         lines = _render_mapping(name, value, fields=fields, limit=limit)
@@ -74,7 +78,7 @@ def _render_text(name: str, text: str, limit: int) -> list[str]:
     if len(text) <= max_chars:
         return [f"{name}: |", *_indent_block(text)]
 
-    clipped = text[:max_chars].rstrip()
+    clipped = _clip_text(text, max_chars)
     return [
         f"{name}: |",
         *_indent_block(clipped),
@@ -90,6 +94,13 @@ def _render_mapping(
     limit: int,
 ) -> list[str]:
     if "error" in value:
+        hypopg_error = _compact_hypopg_error(value["error"])
+        if hypopg_error:
+            return [
+                f"{name}:",
+                "  status: unavailable",
+                f"  error: {hypopg_error}",
+            ]
         return [
             f"{name}:",
             "  error:",
@@ -135,8 +146,12 @@ def _render_rows(
     lines = [f"{name}[{len(shown)}{suffix}]{{{','.join(selected_fields)}}}:"]
     for row in shown:
         lines.append("  " + ",".join(_csvish(row.get(field)) for field in selected_fields))
+    if _has_insufficient_privilege_query(normalized):
+        lines.append(
+            "note: query text is hidden by PostgreSQL privileges; use a role that can view pg_stat_statements query text"
+        )
     if len(normalized) > len(shown):
-        lines.append(f"note: truncated, use --limit {len(normalized)} or --full")
+        lines.append(f"note: truncated, use --limit {len(normalized)}, --full, or narrower filters")
     return lines
 
 
@@ -165,6 +180,41 @@ def _is_row_sequence(value: Any) -> bool:
     return isinstance(value, Iterable) and not isinstance(value, (str, bytes, Mapping))
 
 
+def _parse_structured_text(text: str) -> Any:
+    stripped = text.strip()
+    for candidate in _literal_candidates(stripped):
+        try:
+            parsed = ast.literal_eval(candidate)
+        except (SyntaxError, ValueError):
+            continue
+        if isinstance(parsed, Mapping) or _is_row_sequence(parsed):
+            return parsed
+    return text
+
+
+def _literal_candidates(text: str) -> Iterable[str]:
+    yield text
+    for marker in ("[", "{"):
+        start = text.find(marker)
+        if start > 0:
+            yield text[start:]
+
+
+def _compact_hypopg_error(error: Any) -> str | None:
+    text = str(error)
+    if "hypopg" not in text.lower():
+        return None
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            return line.replace("**", "")
+    return "HypoPG is unavailable."
+
+
+def _has_insufficient_privilege_query(rows: Sequence[Mapping[str, Any]]) -> bool:
+    return any(row.get("query") == "<insufficient privilege>" for row in rows)
+
+
 def _scalar(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         return "[" + ",".join(_scalar(item) for item in value) + "]"
@@ -177,9 +227,19 @@ def _csvish(value: Any) -> str:
     if value is None:
         return "null"
     text = str(value).replace("\n", "\\n")
+    if len(text) > MAX_CELL_CHARS:
+        text = text[: MAX_CELL_CHARS - 1].rstrip() + "…"
     if "," in text or ":" in text:
         return repr(text)
     return text
+
+
+def _clip_text(text: str, max_chars: int) -> str:
+    clipped = text[:max_chars].rstrip()
+    if "\n" not in clipped:
+        return clipped
+    complete_lines = clipped.splitlines()[:-1]
+    return "\n".join(complete_lines).rstrip() or clipped
 
 
 def _indent_block_with_spaces(text: str, spaces: int) -> list[str]:
