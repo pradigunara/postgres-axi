@@ -44,7 +44,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use restricted for read-only access. Defaults to restricted.",
     )
     parser.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Max rows or text chunks to show.")
-    parser.add_argument("--full", action="store_true", default=argparse.SUPPRESS, help="Disable output truncation.")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Disable row, text, and cell truncation.",
+    )
     parser.set_defaults(command="dashboard")
 
     subparsers = parser.add_subparsers(dest="command")
@@ -111,7 +116,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def add_output_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="Max rows or text chunks to show.")
-    parser.add_argument("--full", action="store_true", default=argparse.SUPPRESS, help="Disable output truncation.")
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Disable row, text, and cell truncation.",
+    )
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -127,7 +137,7 @@ async def dispatch(args: argparse.Namespace, adapter: McpApiAdapter) -> str:
     limit = 10**9 if args.full else args.limit
 
     if args.command == "dashboard":
-        return await dashboard(adapter, limit)
+        return await dashboard(adapter, limit, args.full)
     if args.command == "schemas":
         return render_value(
             await adapter.list_schemas(),
@@ -137,6 +147,7 @@ async def dispatch(args: argparse.Namespace, adapter: McpApiAdapter) -> str:
                 "Run `postgres-axi objects public --type table`",
                 "Run `postgres-axi health --type all`",
             ],
+            full=args.full,
         )
     if args.command == "objects":
         objects = await adapter.list_objects(args.schema, args.type)
@@ -148,6 +159,7 @@ async def dispatch(args: argparse.Namespace, adapter: McpApiAdapter) -> str:
                 f"Run `postgres-axi describe {args.schema}.<name> --type {args.type}`",
                 f"Run `postgres-axi objects {args.schema} --type {args.type} --prefix <prefix>`",
             ],
+            full=args.full,
         )
     if args.command == "describe":
         schema, name = split_object(args.object)
@@ -161,15 +173,17 @@ async def dispatch(args: argparse.Namespace, adapter: McpApiAdapter) -> str:
                 f"Run `postgres-axi sql \"select count(*) from {schema}.{name}\"`",
                 f"Run `postgres-axi explain \"select count(*) from {schema}.{name}\"`",
             ],
+            full=args.full,
         )
     if args.command == "sql":
-        return render_value(await adapter.execute_sql(args.query), name="rows", limit=limit)
+        return render_value(await adapter.execute_sql(args.query), name="rows", limit=limit, full=args.full)
     if args.command == "explain":
         return render_value(
             await adapter.explain_query(args.query, args.analyze, args.hypothetical_indexes),
             name="plan",
             limit=limit,
             help=[f"Run `postgres-axi diagnose {shell_quote(args.query)}`"],
+            full=args.full,
         )
     if args.command == "top":
         try:
@@ -186,34 +200,36 @@ async def dispatch(args: argparse.Namespace, adapter: McpApiAdapter) -> str:
                     "`--sort-by resources` failed with division by zero; fell back to `--sort-by total_time`",
                     "Run `postgres-axi top --sort-by mean_time --limit 10`",
                 ],
+                full=args.full,
             )
         return render_value(
             queries,
             name="queries",
             limit=args.limit,
             help=["Run `postgres-axi indexes workload`"],
+            full=args.full,
         )
     if args.command == "health":
-        return render_value(await adapter.analyze_db_health(args.type), name="health", limit=limit)
+        return render_value(await adapter.analyze_db_health(args.type), name="health", limit=limit, full=args.full)
     if args.command == "indexes":
-        return await dispatch_indexes(args, adapter, limit)
+        return await dispatch_indexes(args, adapter, limit, args.full)
     if args.command == "inspect":
         schema, name = split_object(args.object)
-        return await inspect_object(adapter, schema, name, args.type, limit)
+        return await inspect_object(adapter, schema, name, args.type, limit, args.full)
     if args.command == "diagnose":
-        return await diagnose_query(adapter, args.query, args.max_index_size_mb, args.method, limit)
+        return await diagnose_query(adapter, args.query, args.max_index_size_mb, args.method, limit, args.full)
 
     raise AxiError(code="unknown_command", message=f"Unsupported command: {args.command}")
 
 
-async def dashboard(adapter: McpApiAdapter, limit: int) -> str:
+async def dashboard(adapter: McpApiAdapter, limit: int, full: bool) -> str:
     schemas = await adapter.list_schemas()
     extensions = await adapter.list_objects("public", "extension")
     parts = [
         "bin: postgres-axi",
         "description: Inspect and tune the configured PostgreSQL database",
-        render_value(schemas, name="schemas", limit=min(limit, 8)),
-        render_value(extensions, name="extensions", limit=min(limit, 8)),
+        render_value(schemas, name="schemas", limit=min(limit, 8), full=full),
+        render_value(extensions, name="extensions", limit=min(limit, 8), full=full),
         "help[5]:",
         "  Run `postgres-axi schemas`",
         "  Run `postgres-axi objects public --type table`",
@@ -224,17 +240,24 @@ async def dashboard(adapter: McpApiAdapter, limit: int) -> str:
     return "\n".join(parts)
 
 
-async def dispatch_indexes(args: argparse.Namespace, adapter: McpApiAdapter, limit: int) -> str:
+async def dispatch_indexes(args: argparse.Namespace, adapter: McpApiAdapter, limit: int, full: bool) -> str:
     if args.index_command == "workload":
         result = await adapter.analyze_workload_indexes(args.max_index_size_mb, args.method)
-        return render_value(result, name="index_recommendations", limit=limit)
+        return render_value(result, name="index_recommendations", limit=limit, full=full)
     if args.index_command == "queries":
         result = await adapter.analyze_query_indexes(args.queries, args.max_index_size_mb, args.method)
-        return render_value(result, name="index_recommendations", limit=limit)
+        return render_value(result, name="index_recommendations", limit=limit, full=full)
     raise AxiError(code="unknown_index_command", message=f"Unsupported indexes command: {args.index_command}")
 
 
-async def inspect_object(adapter: McpApiAdapter, schema: str, name: str, object_type: str, limit: int) -> str:
+async def inspect_object(
+    adapter: McpApiAdapter,
+    schema: str,
+    name: str,
+    object_type: str,
+    limit: int,
+    full: bool,
+) -> str:
     await adapter.validate_object_metadata(schema, name, object_type)
     details = await adapter.get_object_details(schema, name, object_type)
     return render_value(
@@ -246,6 +269,7 @@ async def inspect_object(adapter: McpApiAdapter, schema: str, name: str, object_
             f"Run `postgres-axi explain \"select count(*) from {schema}.{name}\"`",
             f"Run `postgres-axi indexes queries \"select 1 from {schema}.{name} where <predicate>\"`",
         ],
+        full=full,
     )
 
 
@@ -255,6 +279,7 @@ async def diagnose_query(
     max_index_size_mb: int,
     method: str,
     limit: int,
+    full: bool,
 ) -> str:
     plan = await adapter.explain_query(query, False, [])
     try:
@@ -262,12 +287,13 @@ async def diagnose_query(
             await adapter.analyze_query_indexes([query], max_index_size_mb, method),
             name="index_recommendations",
             limit=limit,
+            full=full,
         )
     except AxiError as exc:
         indexes_output = render_error(exc)
     return "\n".join(
         [
-            render_value(plan, name="plan", limit=limit),
+            render_value(plan, name="plan", limit=limit, full=full),
             indexes_output,
         ]
     )

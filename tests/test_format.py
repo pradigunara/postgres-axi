@@ -75,14 +75,53 @@ def test_render_text_blob_with_python_rows_as_structured_rows() -> None:
     assert "Top queries:" not in output
 
 
+def test_render_text_blob_with_date_and_decimal_literals_as_structured_rows() -> None:
+    output = render_value(
+        "[{'tx_count': 4565, 'min_transaction_date': datetime.date(2020, 9, 17), "
+        "'total_amount': Decimal('12585653571.34')}]",
+        name="rows",
+    )
+
+    assert "rows[1]{tx_count,min_transaction_date,total_amount}:" in output
+    assert "4565,2020-09-17,12585653571.34" in output
+    assert "datetime.date" not in output
+    assert "Decimal(" not in output
+
+
+def test_render_health_text_as_structured_index_rows() -> None:
+    output = render_value(
+        "\n".join(
+            [
+                "Invalid index check: No invalid indexes found.",
+                "Duplicate index check: Duplicate indexes found:",
+                "Index 'transactions_card_id_idx' on table 'transactions' is covered by index 'card_transactions_period_type_idx'",
+                "Index bloat: No bloated indexes found.",
+                "Unused index check: Rarely used indexes found:",
+                "Index 'transactions_recon_id_idx' on table 'transactions' has only been scanned 0 times and uses 0.1MB of space",
+            ]
+        ),
+        name="health",
+    )
+
+    assert "summary:" in output
+    assert "invalid_indexes: ok" in output
+    assert "duplicate_indexes[1]{table,index,covered_by}:" in output
+    assert "transactions,transactions_card_id_idx,card_transactions_period_type_idx" in output
+    assert "unused_indexes[1]{table,index,scans,size_mb}:" in output
+    assert "transactions,transactions_recon_id_idx,0,0.1" in output
+    assert "health: |" not in output
+
+
 def test_render_insufficient_privilege_query_text_adds_note() -> None:
     output = render_value(
         [{"query": "<insufficient privilege>", "calls": 10, "mean_time": 2.5}],
         name="queries",
     )
 
+    lines = output.splitlines()
+
     assert "<insufficient privilege>,10,2.5" in output
-    assert "note: query text is hidden by PostgreSQL privileges" in output
+    assert lines[1].startswith("note: query text is hidden by PostgreSQL privileges")
 
 
 def test_render_rows_truncates_long_cells() -> None:
@@ -90,6 +129,24 @@ def test_render_rows_truncates_long_cells() -> None:
 
     assert "…" in output
     assert "x" * 250 not in output
+
+
+def test_render_rows_full_keeps_long_cells() -> None:
+    query = "select " + "x" * 300
+
+    output = render_value([{"query": query, "calls": 1}], name="queries", full=True)
+
+    assert "…" not in output
+    assert query in output
+
+
+def test_render_mapping_full_keeps_long_nested_values() -> None:
+    value = "x" * 300
+
+    output = render_value({"details": {"long_value": value}}, name="object", full=True)
+
+    assert "…" not in output
+    assert value in output
 
 
 def test_render_text_truncates_on_line_boundaries() -> None:
