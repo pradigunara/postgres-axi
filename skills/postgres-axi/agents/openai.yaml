@@ -1,4 +1,4 @@
 interface:
   display_name: "Postgres AXI"
-  short_description: "Use postgres-axi for compact PostgreSQL inspection and tuning."
-  default_prompt: "Use postgres-axi to inspect the configured PostgreSQL database, diagnose query performance, and summarize findings in compact AXI output."
+  short_description: "Use postgres-axi for compact, redacted PostgreSQL inspection and tuning."
+  default_prompt: "Use postgres-axi to inspect the configured PostgreSQL database, diagnose query performance, run safe read-only SQL by default, and summarize findings in compact AXI output."

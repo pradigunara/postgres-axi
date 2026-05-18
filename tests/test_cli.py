@@ -5,6 +5,7 @@ from postgres_axi.cli import (
     build_parser,
     filter_objects,
     parse_json_list,
+    parse_fields,
     shell_quote,
     split_object,
     validate_args,
@@ -36,6 +37,22 @@ def test_limit_works_before_objects_subcommand() -> None:
 
     assert args.command == "objects"
     assert args.limit == 159
+
+
+def test_timeout_works_after_objects_subcommand() -> None:
+    args = build_parser().parse_args(["objects", "public", "--timeout", "45"])
+    validate_args(args)
+
+    assert args.command == "objects"
+    assert args.timeout == 45
+
+
+def test_no_redact_works_after_sql_subcommand() -> None:
+    args = build_parser().parse_args(["sql", "select 1", "--no-redact"])
+    validate_args(args)
+
+    assert args.command == "sql"
+    assert args.no_redact is True
 
 
 def test_objects_accepts_filter_and_prefix() -> None:
@@ -108,6 +125,17 @@ def test_parse_json_list_rejects_non_list() -> None:
         parse_json_list('{"table": "users"}')
 
     assert exc.value.code == "invalid_json"
+
+
+def test_parse_fields_splits_comma_separated_names() -> None:
+    assert parse_fields("schema, name,type") == ["schema", "name", "type"]
+
+
+def test_parse_fields_rejects_empty_list() -> None:
+    with pytest.raises(AxiError) as exc:
+        parse_fields(" , ")
+
+    assert exc.value.code == "invalid_fields"
 
 
 def test_shell_quote_handles_single_quotes() -> None:

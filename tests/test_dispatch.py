@@ -96,7 +96,8 @@ def _parse(argv: list[str]) -> argparse.Namespace:
 def test_dispatch_dashboard_renders_schemas_extensions_and_help() -> None:
     output, adapter = run_dispatch([])
 
-    assert "bin: postgres-axi" in output
+    assert output.startswith("bin: ")
+    assert "postgres-axi" in output.splitlines()[0]
     assert "schemas[2]{schema}:" in output
     assert "extensions[1]{schema,name,type}:" in output
     assert "Run `postgres-axi indexes workload`" in output
@@ -123,6 +124,15 @@ def test_dispatch_objects() -> None:
     assert "app,app_users,view" in output
     assert "app,audit_log,view" in output
     assert "Run `postgres-axi describe app.<name> --type view`" in output
+    assert adapter.calls == [("list_objects", ("app", "view"))]
+
+
+def test_dispatch_objects_honors_fields() -> None:
+    output, adapter = run_dispatch(["objects", "app", "--type", "view", "--fields", "name,type"])
+
+    assert "objects[3]{name,type}:" in output
+    assert "users,view" in output
+    assert "app,users,view" not in output
     assert adapter.calls == [("list_objects", ("app", "view"))]
 
 
@@ -206,6 +216,49 @@ def test_dispatch_sql() -> None:
     assert adapter.calls == [("execute_sql", ("select 1",))]
 
 
+def test_dispatch_sql_defaults_to_all_selected_columns() -> None:
+    class WideSqlAdapter(FakeAdapter):
+        async def execute_sql(self, sql: str) -> Any:
+            self.calls.append(("execute_sql", (sql,)))
+            return [{"id": 1, "email": "a@example.test", "name": "Ada", "status": "active", "role": "admin"}]
+
+    output, adapter = run_dispatch(["sql", "select * from users limit 1"], WideSqlAdapter())
+
+    assert "rows[1]{id,email,name,status,role}:" in output
+    assert "1,a@example.test,Ada,active,admin" in output
+    assert adapter.calls == [("execute_sql", ("select * from users limit 1",))]
+
+
+def test_dispatch_sql_redacts_sensitive_columns_by_default() -> None:
+    class SensitiveSqlAdapter(FakeAdapter):
+        async def execute_sql(self, sql: str) -> Any:
+            self.calls.append(("execute_sql", (sql,)))
+            return [{"id": 1, "email": "a@example.test", "password": "hash"}]
+
+    output, adapter = run_dispatch(["sql", "select id, email, password from users"], SensitiveSqlAdapter())
+
+    assert "rows[1]{id,email,password}:" in output
+    assert "1,a@example.test,<redacted>" in output
+    assert "hash" not in output
+    assert adapter.calls == [("execute_sql", ("select id, email, password from users",))]
+
+
+def test_dispatch_sql_no_redact_shows_sensitive_columns() -> None:
+    class SensitiveSqlAdapter(FakeAdapter):
+        async def execute_sql(self, sql: str) -> Any:
+            self.calls.append(("execute_sql", (sql,)))
+            return [{"id": 1, "email": "a@example.test", "password": "hash"}]
+
+    output, adapter = run_dispatch(
+        ["sql", "select id, email, password from users", "--no-redact"],
+        SensitiveSqlAdapter(),
+    )
+
+    assert "rows[1]{id,email,password}:" in output
+    assert "1,a@example.test,hash" in output
+    assert adapter.calls == [("execute_sql", ("select id, email, password from users",))]
+
+
 def test_dispatch_explain_with_hypothetical_indexes() -> None:
     query = "select * from users where email = 'a@example.test'"
     indexes = '[{"table": "users", "columns": ["email"], "name": "idx_users_email"}]'
@@ -261,7 +314,7 @@ def test_dispatch_indexes_workload() -> None:
     output, adapter = run_dispatch(["indexes", "workload", "--max-index-size-mb", "256", "--method", "llm"])
 
     assert "index_recommendations[1]{table,columns,method}:" in output
-    assert "users,['email'],llm" in output
+    assert "users,[email],llm" in output
     assert adapter.calls == [("analyze_workload_indexes", (256, "llm"))]
 
 

@@ -22,6 +22,17 @@ def test_render_rows_uses_compact_field_header() -> None:
     assert "public,users,BASE TABLE,ignored" in output
 
 
+def test_render_rows_can_default_to_all_fields() -> None:
+    output = render_value(
+        [{"id": 1, "email": "a@example.test", "name": "Ada", "status": "active", "role": "admin"}],
+        name="rows",
+        default_all_fields=True,
+    )
+
+    assert "rows[1]{id,email,name,status,role}:" in output
+    assert "1,a@example.test,Ada,active,admin" in output
+
+
 def test_render_rows_truncates() -> None:
     output = render_value([{"id": i} for i in range(3)], name="rows", limit=2)
 
@@ -35,6 +46,14 @@ def test_render_error_is_structured() -> None:
     assert "error:" in output
     assert "code: missing_database_uri" in output
     assert "help[1]:" in output
+
+
+def test_render_error_formats_multiline_messages_as_block() -> None:
+    output = render_error(AxiError(code="upstream_error", message="first line\nsecond line"))
+
+    assert "message: |" in output
+    assert "    first line" in output
+    assert "    second line" in output
 
 
 def test_render_mapping_error_is_structured_and_hides_trace() -> None:
@@ -88,6 +107,73 @@ def test_render_text_blob_with_date_and_decimal_literals_as_structured_rows() ->
     assert "Decimal(" not in output
 
 
+def test_render_text_blob_with_uuid_literals_as_structured_rows() -> None:
+    output = render_value(
+        "[{'id': UUID('eb6f6007-a41f-42b9-b864-7868db05be24'), 'amount': 125000.5}]",
+        name="rows",
+    )
+
+    assert "rows[1]{id,amount}:" in output
+    assert "eb6f6007-a41f-42b9-b864-7868db05be24,125000.5" in output
+    assert "UUID(" not in output
+
+
+def test_render_text_blob_with_datetime_literals_as_structured_rows() -> None:
+    output = render_value(
+        "[{'created_at': datetime.datetime(2020, 11, 28, 9, 43, 8, 961698, tzinfo=datetime.timezone.utc)}]",
+        name="rows",
+    )
+
+    assert "rows[1]{created_at}:" in output
+    assert "2020-11-28T09:43:08.961698Z" in output
+    assert "datetime.datetime" not in output
+
+
+def test_render_text_blob_preserves_default_all_fields() -> None:
+    output = render_value(
+        "[{'id': UUID('eb6f6007-a41f-42b9-b864-7868db05be24'), 'file_date': datetime.date(2024, 9, 18), "
+        "'amount': 125000.5, 'transaction_type': 'C', 'merchant': 'FESBUKK'}]",
+        name="rows",
+        default_all_fields=True,
+    )
+
+    assert "rows[1]{id,file_date,amount,transaction_type,merchant}:" in output
+    assert "eb6f6007-a41f-42b9-b864-7868db05be24,2024-09-18,125000.5,C,FESBUKK" in output
+
+
+def test_render_rows_redacts_sensitive_field_names() -> None:
+    output = render_value(
+        [
+            {
+                "id": 1,
+                "password": "hash",
+                "api_token": "secret-token",
+                "refresh_token": "refresh",
+                "session_id": "session",
+                "private_key": "key",
+                "name": "Ada",
+            }
+        ],
+        name="rows",
+        default_all_fields=True,
+    )
+
+    assert "rows[1]{id,password,api_token,refresh_token,session_id,private_key,name}:" in output
+    assert "1,<redacted>,<redacted>,<redacted>,<redacted>,<redacted>,Ada" in output
+    assert "secret-token" not in output
+
+
+def test_render_rows_can_disable_redaction() -> None:
+    output = render_value(
+        [{"id": 1, "password": "hash", "api_token": "secret-token"}],
+        name="rows",
+        default_all_fields=True,
+        redact=False,
+    )
+
+    assert "1,hash,secret-token" in output
+
+
 def test_render_health_text_as_structured_index_rows() -> None:
     output = render_value(
         "\n".join(
@@ -138,6 +224,25 @@ def test_render_rows_full_keeps_long_cells() -> None:
 
     assert "…" not in output
     assert query in output
+
+
+def test_render_rows_falls_back_when_requested_fields_do_not_exist() -> None:
+    output = render_value([{"id": 1, "email": "a@example.test"}], name="rows", fields=["missing"])
+
+    assert "rows[1]{id,email}:" in output
+    assert "1,a@example.test" in output
+
+
+def test_render_mapping_falls_back_when_requested_fields_do_not_exist() -> None:
+    output = render_value(
+        {"basic": {"schema": "public", "name": "users"}, "columns": [{"column": "id", "data_type": "integer"}]},
+        name="object",
+        fields=["schema", "name", "type"],
+    )
+
+    assert "object:" in output
+    assert "basic:" in output
+    assert "columns[1]{column,data_type}:" in output
 
 
 def test_render_mapping_full_keeps_long_nested_values() -> None:

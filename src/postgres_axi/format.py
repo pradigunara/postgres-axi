@@ -9,6 +9,19 @@ from typing import Any
 
 DEFAULT_LIMIT = 20
 MAX_CELL_CHARS = 180
+REDACTED_FIELD_MARKERS = (
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "private_key",
+    "credential",
+    "session",
+    "cookie",
+)
 
 
 @dataclass
@@ -41,7 +54,11 @@ def unwrap_mcp_text(response: Any) -> Any:
 
 
 def render_error(error: AxiError) -> str:
-    lines = ["error:", f"  code: {error.code}", f"  message: {error.message}"]
+    lines = ["error:", f"  code: {error.code}"]
+    if "\n" in error.message:
+        lines.extend(["  message: |", *_indent_block(error.message, spaces=4)])
+    else:
+        lines.append(f"  message: {error.message}")
     if error.hint:
         lines.extend(["help[1]:", f"  {error.hint}"])
     return "\n".join(lines)
@@ -55,18 +72,40 @@ def render_value(
     fields: Sequence[str] | None = None,
     help: Sequence[str] = (),
     full: bool = False,
+    empty: str | None = None,
+    default_all_fields: bool = False,
+    redact: bool = True,
 ) -> str:
     if value is None:
         lines = [f"{name}: null"]
     elif isinstance(value, str):
         structured = _parse_structured_text(value)
         if structured is not value:
-            return render_value(structured, name=name, limit=limit, fields=fields, help=help, full=full)
+            return render_value(
+                structured,
+                name=name,
+                limit=limit,
+                fields=fields,
+                help=help,
+                full=full,
+                empty=empty,
+                default_all_fields=default_all_fields,
+                redact=redact,
+            )
         lines = _render_text(name, value, limit)
     elif isinstance(value, Mapping):
-        lines = _render_mapping(name, value, fields=fields, limit=limit, full=full)
+        lines = _render_mapping(name, value, fields=fields, limit=limit, full=full, redact=redact)
     elif _is_row_sequence(value):
-        lines = _render_rows(name, list(value), fields=fields, limit=limit, full=full)
+        lines = _render_rows(
+            name,
+            list(value),
+            fields=fields,
+            limit=limit,
+            full=full,
+            empty=empty,
+            default_all_fields=default_all_fields,
+            redact=redact,
+        )
     else:
         lines = [f"{name}: {value}"]
 
@@ -95,6 +134,7 @@ def _render_mapping(
     fields: Sequence[str] | None,
     limit: int,
     full: bool,
+    redact: bool,
 ) -> list[str]:
     if "error" in value:
         hypopg_error = _compact_hypopg_error(value["error"])
@@ -112,7 +152,7 @@ def _render_mapping(
             *_indent_block(str(value["error"]), spaces=6),
         ]
 
-    selected = list(fields) if fields else list(value.keys())
+    selected = _selected_mapping_fields(value, fields)
     lines = [f"{name}:"]
     for key in selected:
         if key.startswith("_"):
@@ -121,13 +161,13 @@ def _render_mapping(
             continue
         child = value[key]
         if _is_row_sequence(child):
-            lines.extend(_render_rows(str(key), list(child), limit=limit, full=full))
+            lines.extend(_render_rows(str(key), list(child), limit=limit, full=full, redact=redact))
         elif isinstance(child, Mapping):
             lines.append(f"  {key}:")
             for nested_key, nested_value in child.items():
-                lines.append(f"    {nested_key}: {_scalar(nested_value, full=full)}")
+                lines.append(f"    {nested_key}: {_display_value(nested_key, nested_value, full=full, redact=redact)}")
         else:
-            lines.append(f"  {key}: {_scalar(child, full=full)}")
+            lines.append(f"  {key}: {_display_value(key, child, full=full, redact=redact)}")
     return lines
 
 
@@ -138,12 +178,15 @@ def _render_rows(
     fields: Sequence[str] | None = None,
     limit: int = DEFAULT_LIMIT,
     full: bool = False,
+    empty: str | None = None,
+    default_all_fields: bool = False,
+    redact: bool = True,
 ) -> list[str]:
     if not rows:
-        return [f"{name}[0]: none"]
+        return [empty or f"{name}[0]: none"]
 
     normalized = [_normalize_row(row) for row in rows]
-    selected_fields = list(fields) if fields else _default_fields(normalized)
+    selected_fields = _selected_row_fields(normalized, fields, default_all_fields=default_all_fields)
     shown = normalized[:limit]
     suffix = f" of {len(normalized)}" if len(normalized) > len(shown) else ""
 
@@ -153,7 +196,9 @@ def _render_rows(
             "note: query text is hidden by PostgreSQL privileges; use a role that can view pg_stat_statements query text"
         )
     for row in shown:
-        lines.append("  " + ",".join(_csvish(row.get(field), full=full) for field in selected_fields))
+        lines.append(
+            "  " + ",".join(_display_value(field, row.get(field), full=full, redact=redact) for field in selected_fields)
+        )
     if name != "queries" and _has_insufficient_privilege_query(normalized):
         lines.append(
             "note: query text is hidden by PostgreSQL privileges; use a role that can view pg_stat_statements query text"
@@ -174,6 +219,37 @@ def _default_fields(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         return []
     keys = list(rows[0].keys())
     return keys[:4]
+
+
+def _selected_mapping_fields(value: Mapping[str, Any], fields: Sequence[str] | None) -> list[str]:
+    if not fields:
+        return list(value.keys())
+    selected = [field for field in fields if field in value]
+    return selected or list(value.keys())
+
+
+def _selected_row_fields(
+    rows: Sequence[Mapping[str, Any]],
+    fields: Sequence[str] | None,
+    *,
+    default_all_fields: bool = False,
+) -> list[str]:
+    if not fields:
+        if default_all_fields:
+            return _all_fields(rows)
+        return _default_fields(rows)
+    available = set().union(*(row.keys() for row in rows))
+    selected = [field for field in fields if field in available]
+    return selected or _default_fields(rows)
+
+
+def _all_fields(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    selected: list[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in selected:
+                selected.append(key)
+    return selected
 
 
 def _normalize_row(row: Any) -> Mapping[str, Any]:
@@ -212,6 +288,12 @@ def _literal_candidates(text: str) -> Iterable[str]:
 
 
 def _normalize_literal_text(text: str) -> str:
+    text = re.sub(r"UUID\('([^']*)'\)", r"'\1'", text)
+    text = re.sub(
+        r"datetime\.datetime\((\d{4}),\s*(\d{1,2}),\s*(\d{1,2}),\s*(\d{1,2}),\s*(\d{1,2}),\s*(\d{1,2})(?:,\s*(\d{1,6}))?(?:,\s*tzinfo=datetime\.timezone\.utc)?\)",
+        _datetime_literal,
+        text,
+    )
     text = re.sub(r"datetime\.date\((\d{4}),\s*(\d{1,2}),\s*(\d{1,2})\)", _date_literal, text)
     text = re.sub(r"Decimal\('([^']*)'\)", r"'\1'", text)
     return text
@@ -222,6 +304,19 @@ def _date_literal(match: re.Match[str]) -> str:
     month = int(match.group(2))
     day = int(match.group(3))
     return f"'{year:04d}-{month:02d}-{day:02d}'"
+
+
+def _datetime_literal(match: re.Match[str]) -> str:
+    year = int(match.group(1))
+    month = int(match.group(2))
+    day = int(match.group(3))
+    hour = int(match.group(4))
+    minute = int(match.group(5))
+    second = int(match.group(6))
+    microsecond = match.group(7)
+    suffix = f".{microsecond}" if microsecond else ""
+    timezone = "Z" if "tzinfo=datetime.timezone.utc" in match.group(0) else ""
+    return f"'{year:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:{second:02d}{suffix}{timezone}'"
 
 
 def _parse_health_text(text: str) -> Mapping[str, Any] | None:
@@ -330,6 +425,17 @@ def _csvish(value: Any, *, full: bool = False) -> str:
     if "," in text or ":" in text:
         return repr(text)
     return text
+
+
+def _display_value(field: str, value: Any, *, full: bool = False, redact: bool = True) -> str:
+    if redact and _is_redacted_field(field):
+        return "<redacted>"
+    return _scalar(value, full=full)
+
+
+def _is_redacted_field(field: str) -> bool:
+    normalized = field.lower()
+    return any(marker in normalized for marker in REDACTED_FIELD_MARKERS)
 
 
 def _clip_text(text: str, max_chars: int) -> str:

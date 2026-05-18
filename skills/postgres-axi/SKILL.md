@@ -1,36 +1,13 @@
 ---
 name: postgres-axi
-description: Use postgres-axi for PostgreSQL inspection, schema exploration, query execution, EXPLAIN plans, health checks, pg_stat_statements analysis, and index recommendation workflows when an agent should prefer compact AXI-style CLI output over verbose MCP schemas or ad hoc SQL. Trigger when the user asks to inspect a Postgres database, diagnose a slow query, review tables/indexes/constraints, check database health, or summarize database state from the configured DATABASE_URI.
+description: Use postgres-axi for compact PostgreSQL inspection, SQL execution, EXPLAIN plans, health checks, pg_stat_statements analysis, and index recommendations from the configured DATABASE_URI.
 ---
 
 # Postgres AXI
 
-## Core Rule
+Prefer `postgres-axi` over raw `psql` or direct `postgres-mcp` calls when its command surface covers the task. Output is compact AXI-style text with structured errors, truncation notes, redaction, and next-step hints.
 
-Prefer `postgres-axi` over raw `psql` or direct `postgres-mcp` calls when the task can be answered by its command surface. It is designed for agent workflows: compact output, explicit truncation, structured errors, and next-step hints.
-
-`postgres-axi` defaults to restricted mode. Use unrestricted mode only when the
-user explicitly needs write-capable SQL:
-
-```bash
-postgres-axi --access-mode unrestricted ...
-```
-
-## Setup Checks
-
-Before database work, verify the CLI is available and configuration exists:
-
-```bash
-postgres-axi
-```
-
-If the command returns `missing_database_uri`, ask for or set `DATABASE_URI`. If it returns `missing_dependency`, install or expose `postgres-mcp` in the current environment before continuing.
-
-Do not paste credentials into the final response. If a command output includes a connection string or secret, summarize it without the secret.
-
-## Command Selection
-
-Use these commands for common tasks:
+## Commands
 
 ```bash
 postgres-axi
@@ -47,42 +24,35 @@ postgres-axi indexes workload
 postgres-axi indexes queries "select * from public.users where email = 'a@example.com'"
 ```
 
-Use `inspect` when the user asks about a specific table or view. It combines details with next commands.
+Use `inspect` for a specific table/view, `diagnose` for a specific slow query, and `top` before `indexes workload` for broad optimization work.
 
-Use `diagnose` when the user gives a query and asks about performance. It combines an explain plan with index recommendations.
+## Output
 
-Use `top` before `indexes workload` when the user asks generally what to optimize. `top` identifies the candidate workload; `indexes workload` recommends indexes.
-
-## Output Handling
-
-Treat AXI output as already summarized. Preserve important rows, counts, warnings, and `help[...]` hints, but avoid expanding compact output into verbose JSON unless the user asks.
-
-If output is truncated, rerun with `--limit N` or `--full` only when the missing rows are necessary for the decision:
-
-```bash
-postgres-axi --limit 100 objects public --type table
-postgres-axi --full explain "select ..."
-```
+- DB commands default to `--timeout 30`; raise it only for expected slow checks.
+- `sql` shows all columns returned by the query. Use `--fields` to narrow wide output.
+- Discovery/list commands keep compact default fields.
+- Use `--limit N` for more rows and `--full` for untruncated long cells.
+- Sensitive-looking columns are redacted by default: password/passwd/pwd, secret, token, api_key/apikey, private_key, credential, session, cookie.
+- Use `--no-redact` only when the user explicitly needs raw sensitive values and it is safe to show them.
 
 ## Safety
 
-Default to read-only behavior:
+Default to restricted, read-only behavior:
 
 ```bash
 postgres-axi --access-mode restricted sql "select ..."
 ```
 
-Do not run data-changing SQL unless the user explicitly asks for it and the risk is clear. For destructive SQL, explain the intended statement first and wait for user confirmation unless they already gave exact SQL and explicit permission to execute it.
+Use `--access-mode unrestricted` only when the user explicitly needs writes. For write probes, prefer temporary tables. If temp tables are unavailable, use a guarded one-row update and immediate revert:
 
-Prefer `explain` without `--analyze` first. Use `--analyze` only when executing the query is safe and the user needs runtime evidence.
+```bash
+postgres-axi sql "select id, name from public.users where name is not null limit 1"
+postgres-axi --access-mode unrestricted sql "update public.users set name = '<probe>' where id = '<id>' and name = '<previous>' returning id,name"
+postgres-axi --access-mode unrestricted sql "update public.users set name = '<previous>' where id = '<id>' and name = '<probe>' returning id,name"
+```
+
+Do not run destructive SQL unless the user explicitly requested it and the risk is clear. Prefer `explain` without `--analyze`; use `--analyze` only when executing the query is safe.
 
 ## Reporting
 
-When reporting results, include:
-
-- the command run
-- the relevant findings
-- any truncation or missing-extension caveats
-- the next command if more evidence is needed
-
-For performance findings, distinguish evidence from recommendation. Example: “The plan shows a sequential scan on `public.users`; `indexes queries` recommends an index on `email`.”
+Report the command run, relevant rows/findings, truncation or extension caveats, and the next command only when more evidence is needed. Do not include credentials or raw secrets in final responses.

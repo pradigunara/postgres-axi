@@ -10,6 +10,7 @@ from postgres_axi.format import AxiError
 class FakeMcpApiAdapter:
     instances: list["FakeMcpApiAdapter"] = []
     enter_error: AxiError | None = None
+    enter_delay: float = 0.0
 
     def __init__(self, database_url: str | None, access_mode: str) -> None:
         self.database_url = database_url
@@ -21,6 +22,8 @@ class FakeMcpApiAdapter:
         return self
 
     async def __aenter__(self) -> "FakeMcpApiAdapter":
+        if self.enter_delay:
+            await asyncio.sleep(self.enter_delay)
         if self.enter_error is not None:
             raise self.enter_error
         return self
@@ -50,6 +53,7 @@ class FakeMcpApiAdapter:
 def fake_adapter(monkeypatch: pytest.MonkeyPatch) -> type[FakeMcpApiAdapter]:
     FakeMcpApiAdapter.instances = []
     FakeMcpApiAdapter.enter_error = None
+    FakeMcpApiAdapter.enter_delay = 0.0
     monkeypatch.setattr(cli, "McpApiAdapter", FakeMcpApiAdapter)
     return FakeMcpApiAdapter
 
@@ -70,7 +74,8 @@ def test_no_args_runs_dashboard_successfully(
         ("list_objects", ("public", "extension")),
     ]
     output = capsys.readouterr().out
-    assert "bin: postgres-axi" in output
+    assert output.startswith("bin: ")
+    assert "postgres-axi" in output.splitlines()[0]
     assert "schemas[1]" in output
     assert "extensions[1]" in output
 
@@ -129,4 +134,57 @@ def test_invalid_hypothetical_indexes_json_renders_invalid_json_and_returns_1(
     output = capsys.readouterr().out
     assert output.startswith("error:\n  code: invalid_json\n  message: ")
     assert "Expecting property name enclosed in double quotes" in output
+    assert fake_adapter.instances == []
+
+
+def test_parser_usage_errors_are_structured_stdout(
+    fake_adapter: type[FakeMcpApiAdapter],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = run_cli(["objects", "--type", "invalid"])
+
+    assert code == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "error:\n  code: usage_error\n" in captured.out
+    assert "invalid choice" in captured.out
+    assert fake_adapter.instances == []
+
+
+def test_integrations_do_not_require_database_connection(
+    fake_adapter: type[FakeMcpApiAdapter],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = run_cli(["integrations", "--app", "codex"])
+
+    assert code == 0
+    output = capsys.readouterr().out
+    assert "integrations[1]{app,target,event,command}:" in output
+    assert "codex,~/.codex/hooks.json,SessionStart" in output
+    assert fake_adapter.instances == []
+
+
+def test_database_timeout_renders_structured_output(
+    fake_adapter: type[FakeMcpApiAdapter],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake_adapter.enter_delay = 0.05
+
+    code = run_cli(["--timeout", "0.001", "schemas"])
+
+    assert code == 1
+    output = capsys.readouterr().out
+    assert "error:\n  code: timeout\n" in output
+    assert "Operation exceeded 0.001s." in output
+
+
+def test_invalid_timeout_renders_structured_output(
+    fake_adapter: type[FakeMcpApiAdapter],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = run_cli(["--timeout", "0", "schemas"])
+
+    assert code == 1
+    output = capsys.readouterr().out
+    assert "error:\n  code: invalid_timeout\n" in output
     assert fake_adapter.instances == []
